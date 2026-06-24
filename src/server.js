@@ -1,72 +1,43 @@
 const express = require('express');
-const sql = require('mssql');
-const { v4: uuidv4 } = require('uuid');
+
+// Thin composition only:
+// - routes handle HTTP endpoint wiring
+// - engines handle form logic
+// - agents handle bounded execution logic
+const intakeRoutes = require('./routes/intake_form_routes');
 
 const app = express();
 app.use(express.json());
 
-const intakeRoutes = require('./intake_form_routes');
-app.use(intakeRoutes);
+// Simple health check
+app.get('/health', (_req, res) => {
+    res.status(200).json({
+        status: 'ok',
+        service: 'iam-api',
+        mode: 'express-local'
+    });
+});
 
-const { buildFormDefinition } = require('./dynamic_form_engine');
-const { assignUserToApp } = require('./execution-agent');
+// Mount feature routes under /api
+app.use('/api', intakeRoutes);
 
-const config = {
-    server: "iam-agent-db.database.windows.net",
-    database: "IAM_request_db",
-    user: "CloudSA3879c360",
-    password: "Kw$papy3!!",
-    port: 1433,
-    options: { encrypt: true }
-};
+// Centralized error handler
+app.use((err, _req, res, _next) => {
+    console.error(err);
 
-function normalize(body, correlation_id) {
-    return {
-        correlation_id,
-        requester: body.requester,
-        action: body.action,
-        target_type: body.target_type,
-        target_resource: body.target_resource,
-        target_user: body.target_user || null,
-        collected_data: {
-            justification: body.request_justification || body.justification || null
-        }
-    };
+    res.status(err.status || 500).json({
+        status: 'error',
+        message: err.message || 'Unexpected server error'
+    });
+});
+
+const port = Number(process.env.PORT || 3000);
+
+// Only listen when this file is run directly with `node src/server.js`
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`IAM API local server running on port ${port}`);
+    });
 }
 
-app.post('/requests', async (req, res) => {
-    try {
-        const correlation_id = uuidv4();
-
-        const normalized = normalize(req.body, correlation_id);
-        const form = buildFormDefinition(normalized);
-
-        if (!form.can_submit_now) {
-            return res.status(400).json({
-                status: "incomplete_request",
-                missing_fields: form.missing_fields
-            });
-        }
-
-        // ✅ EXECUTION (HARDCODE FOR TEST)
-        await assignUserToApp({
-            userId: "USER_ID",
-            appId: "APP_ID",
-            token: "OKTA_API_TOKEN",
-            domain: "yourdomain.okta.com"
-        });
-
-        return res.json({
-            correlation_id,
-            status: "executed"
-        });
-
-    } catch (e) {
-        console.error(e);
-        res.status(500).send(e.message);
-    }
-});
-
-app.listen(3000, () => {
-    console.log("running");
-});
+module.exports = app;

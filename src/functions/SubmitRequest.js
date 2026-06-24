@@ -20,12 +20,12 @@ const requestsTableClient = TableClient.fromConnectionString(
 // ==============================
 // HELPERS
 // ==============================
-function logRequest(context, label, data) {
-    context.log(label, JSON.stringify(data));
-}
-
 function normalize(value) {
     return String(value || '').trim().toLowerCase();
+}
+
+function buildDuplicateSignature(subjectEmail, target, action) {
+    return `${normalize(subjectEmail)}|${normalize(target)}|${normalize(action)}`;
 }
 
 function parseCsvEnv(name) {
@@ -68,37 +68,70 @@ function parseToxicCombos(name) {
         .filter(Boolean);
 }
 
-function safeParse(value) {
-    try {
-        return value ? JSON.parse(value) : null;
-    } catch {
-        return null;
-    }
+// ==============================
+// STRUCTURED LOGGING SCHEMA
+// Logs JSON to context.log() so traces remain queryable.
+// ==============================
+function buildLogEnvelope(eventName, severity, fields = {}) {
+    return {
+        schemaVersion: '1.0',
+        component: 'SubmitRequest.js',
+        eventName,
+        severity,
+        timestamp: new Date().toISOString(),
+
+        requestId: fields.requestId || null,
+        correlationId: fields.correlationId || null,
+        requester: fields.requester || null,
+        subjectEmail: fields.subjectEmail || null,
+        target: fields.target || null,
+        action: fields.action || null,
+        requestType: fields.requestType || null,
+
+        status: fields.status || null,
+        riskTier: fields.riskTier || null,
+        approvalRoute: fields.approvalRoute || null,
+
+        duplicateSignature: fields.duplicateSignature || null,
+        duplicateFound: fields.duplicateFound ?? null,
+        existingRequestId: fields.existingRequestId || null,
+        existingStatus: fields.existingStatus || null,
+
+        alreadyHasAccess: fields.alreadyHasAccess ?? null,
+        conflictDetected: fields.conflictDetected ?? null,
+        recommendation: fields.recommendation || null,
+
+        provider: fields.provider || null,
+        operation: fields.operation || null,
+        failureType: fields.failureType || null,
+        verified: fields.verified ?? null,
+
+        details: fields.details || {}
+    };
+}
+
+function emitLog(context, eventName, fields = {}, severity = 'Information') {
+    const envelope = buildLogEnvelope(eventName, severity, fields);
+    context.log(JSON.stringify(envelope));
 }
 
 // ==============================
 // DUPLICATE REQUEST DETECTION
-// Reads existing open requests from the same table and blocks:
-// same subject.email + target + action where status is open.
-// Open statuses are intentionally limited to avoid false positives.
+// Query by persisted duplicateSignature + open statuses.
 // ==============================
-async function findDuplicateOpenRequest(candidate, context) {
+async function findDuplicateOpenRequest(duplicateSignature, context) {
     const openStatuses = new Set(['PENDING_APPROVAL', 'APPROVED']);
 
-    // Point the query at REQUEST rows only.
-    // Additional filtering happens in code because subject.email is stored in JSON.
     const entities = requestsTableClient.listEntities({
         queryOptions: {
-            filter: `partitionKey eq 'REQUEST'`,
+            filter: `partitionKey eq 'REQUEST' and duplicateSignature eq '${duplicateSignature.replace(/'/g, "''")}'`,
             select: [
                 'rowKey',
                 'status',
-                'action',
-                'target',
                 'requester',
-                'subjectJson',
                 'correlationId',
-                'submittedAt'
+                'submittedAt',
+                'duplicateSignature'
             ]
         }
     });
@@ -108,31 +141,13 @@ async function findDuplicateOpenRequest(candidate, context) {
             continue;
         }
 
-        const subject = safeParse(entity.subjectJson);
-        const sameSubject =
-            normalize(subject?.email) === normalize(candidate.subject?.email);
-
-        const sameTarget =
-            normalize(entity.target) === normalize(candidate.target);
-
-        const sameAction =
-            normalize(entity.action) === normalize(candidate.action);
-
-        if (sameSubject && sameTarget && sameAction) {
-            if (context) {
-                context.log(
-                    `DUPLICATE_REQUEST_DETECTED existingRequestId=${entity.rowKey} existingStatus=${entity.status}`
-                );
-            }
-
-            return {
-                requestId: entity.rowKey,
-                status: entity.status,
-                requester: entity.requester || null,
-                correlationId: entity.correlationId || null,
-                submittedAt: entity.submittedAt || null
-            };
-        }
+        return {
+            requestId: entity.rowKey,
+            status: entity.status,
+            requester: entity.requester || null,
+            correlationId: entity.correlationId || null,
+            submittedAt: entity.submittedAt || null
+        };
     }
 
     return null;
@@ -191,7 +206,6 @@ function classifyRisk(record) {
     const blocked = parseCsvEnv('BLOCKED_GROUPS');
     const allowed = parseCsvEnv('ALLOWED_GROUPS');
 
-    // CRITICAL
     if (blocked.has(target)) {
         return {
             tier: 'CRITICAL',
@@ -199,7 +213,6 @@ function classifyRisk(record) {
         };
     }
 
-    // HIGH - sensitive keywords
     if (
         target.includes('admin') ||
         target.includes('privileged') ||
@@ -211,7 +224,6 @@ function classifyRisk(record) {
         };
     }
 
-    // LOW - explicit allowlist
     if (allowed.has(target)) {
         return {
             tier: 'LOW',
@@ -219,7 +231,6 @@ function classifyRisk(record) {
         };
     }
 
-    // MEDIUM - default classification
     return {
         tier: 'MEDIUM',
         reason: 'Default classification'
@@ -371,9 +382,22 @@ async function oktaRequest(method, path, options = {}) {
 
                 if (retry && retryableStatuses.has(response.status) && attempt < maxAttempts) {
                     const delay = backoffBase * Math.pow(2, attempt);
-                    if (context) {
-                        context.log(`OKTA RETRY attempt=${attempt} delayMs=${delay} status=${response.status}`);
-                    }
+
+                    emitLog(
+                        context,
+                        'IAM_OKTA_RETRY',
+                        {
+                            status: 'RETRYING',
+                            provider: 'okta',
+                            details: {
+                                attempt,
+                                delayMs: delay,
+                                statusCode: response.status
+                            }
+                        },
+                        'Warning'
+                    );
+
                     await sleep(delay);
                     continue;
                 }
@@ -390,9 +414,21 @@ async function oktaRequest(method, path, options = {}) {
             }
 
             const delay = 300 * Math.pow(2, attempt);
-            if (context) {
-                context.log(`OKTA RETRY exception attempt=${attempt} delayMs=${delay} message=${error.message}`);
-            }
+
+            emitLog(
+                context,
+                'IAM_OKTA_RETRY_EXCEPTION',
+                {
+                    status: 'RETRYING',
+                    provider: 'okta',
+                    details: {
+                        attempt,
+                        delayMs: delay,
+                        message: error.message
+                    }
+                },
+                'Warning'
+            );
 
             await sleep(delay);
         }
@@ -549,6 +585,18 @@ app.http('SubmitRequest', {
         try {
             body = await request.json();
         } catch {
+            emitLog(
+                context,
+                'IAM_REQUEST_SUBMIT_RECEIVED',
+                {
+                    status: 'REJECTED',
+                    details: {
+                        reason: 'Invalid JSON'
+                    }
+                },
+                'Error'
+            );
+
             return {
                 status: 400,
                 jsonBody: {
@@ -561,6 +609,24 @@ app.http('SubmitRequest', {
         const errors = validateRequest(body);
 
         if (errors.length > 0) {
+            emitLog(
+                context,
+                'IAM_REQUEST_SUBMIT_RECEIVED',
+                {
+                    correlationId: body?.requestMetadata?.correlationId || null,
+                    requester: body?.requester?.email || null,
+                    subjectEmail: body?.subject?.email || null,
+                    target: body?.target?.targetIdentifier || null,
+                    action: body?.requestedAction?.actionType || null,
+                    requestType: body?.requestContext?.requestType || null,
+                    status: 'REJECTED',
+                    details: {
+                        errors
+                    }
+                },
+                'Warning'
+            );
+
             return {
                 status: 400,
                 jsonBody: {
@@ -571,6 +637,11 @@ app.http('SubmitRequest', {
         }
 
         const caller = getCallerIdentity(request, body.requester?.email || 'anonymous');
+        const duplicateSignature = buildDuplicateSignature(
+            body.subject.email,
+            body.target.targetIdentifier,
+            body.requestedAction.actionType
+        );
 
         const requestRecord = {
             requestId: `req-${Date.now()}`,
@@ -584,6 +655,8 @@ app.http('SubmitRequest', {
             action: body.requestedAction.actionType,
             target: body.target.targetIdentifier,
             submittedAt: new Date().toISOString(),
+
+            duplicateSignature,
 
             approval: null,
             execution: null,
@@ -603,11 +676,23 @@ app.http('SubmitRequest', {
             verification: null
         };
 
-        // Duplicate request detection FIRST to avoid unnecessary downstream calls
-        const duplicate = await findDuplicateOpenRequest(requestRecord, context);
+        emitLog(context, 'IAM_REQUEST_SUBMIT_RECEIVED', {
+            requestId: requestRecord.requestId,
+            correlationId: requestRecord.correlationId,
+            requester: requestRecord.requester,
+            subjectEmail: requestRecord.subject.email,
+            target: requestRecord.target,
+            action: requestRecord.action,
+            requestType: requestRecord.requestType,
+            status: requestRecord.status,
+            duplicateSignature: requestRecord.duplicateSignature
+        });
+
+        const duplicate = await findDuplicateOpenRequest(duplicateSignature, context);
 
         requestRecord.policy.duplicateCheck = {
             duplicateFound: !!duplicate,
+            duplicateSignature,
             existingRequestId: duplicate?.requestId || null,
             existingStatus: duplicate?.status || null,
             checkedAt: new Date().toISOString()
@@ -624,7 +709,25 @@ app.http('SubmitRequest', {
 
             await saveRequest(requestRecord);
 
-            logRequest(context, 'IAM_REQUEST_DUPLICATE_REJECTED', requestRecord);
+            emitLog(
+                context,
+                'IAM_REQUEST_DUPLICATE_REJECTED',
+                {
+                    requestId: requestRecord.requestId,
+                    correlationId: requestRecord.correlationId,
+                    requester: requestRecord.requester,
+                    subjectEmail: requestRecord.subject.email,
+                    target: requestRecord.target,
+                    action: requestRecord.action,
+                    requestType: requestRecord.requestType,
+                    status: requestRecord.status,
+                    duplicateSignature,
+                    duplicateFound: true,
+                    existingRequestId: duplicate.requestId,
+                    existingStatus: duplicate.status
+                },
+                'Warning'
+            );
 
             return {
                 status: 409,
@@ -638,13 +741,11 @@ app.http('SubmitRequest', {
             };
         }
 
-        // First-pass risk classification from target semantics
         const risk = classifyRisk(requestRecord);
         requestRecord.policy.riskTier = risk.tier;
         requestRecord.policy.riskReason = risk.reason;
         requestRecord.policy.approvalRoute = getApprovalRoute(risk.tier);
 
-        // CRITICAL → policy rejected immediately
         if (risk.tier === 'CRITICAL') {
             requestRecord.status = 'POLICY_REJECTED';
             requestRecord.execution = {
@@ -660,7 +761,27 @@ app.http('SubmitRequest', {
 
             await saveRequest(requestRecord);
 
-            logRequest(context, 'IAM_REQUEST_POLICY_REJECTED', requestRecord);
+            emitLog(
+                context,
+                'IAM_REQUEST_POLICY_REJECTED',
+                {
+                    requestId: requestRecord.requestId,
+                    correlationId: requestRecord.correlationId,
+                    requester: requestRecord.requester,
+                    subjectEmail: requestRecord.subject.email,
+                    target: requestRecord.target,
+                    action: requestRecord.action,
+                    requestType: requestRecord.requestType,
+                    status: requestRecord.status,
+                    riskTier: requestRecord.policy.riskTier,
+                    approvalRoute: requestRecord.policy.approvalRoute,
+                    duplicateSignature: requestRecord.duplicateSignature,
+                    details: {
+                        reason: requestRecord.policy.riskReason
+                    }
+                },
+                'Warning'
+            );
 
             return {
                 status: 403,
@@ -674,14 +795,12 @@ app.http('SubmitRequest', {
             };
         }
 
-        // Entitlement intelligence assessment (read-only)
         try {
             const entitlementAssessment = await assessEntitlements(requestRecord, context);
             requestRecord.policy.entitlementAssessment = entitlementAssessment;
             requestRecord.oktaUserId = entitlementAssessment.oktaUserId;
             requestRecord.oktaGroupId = entitlementAssessment.oktaGroupId;
 
-            // If the subject already has access, reject the request as not needed
             if (entitlementAssessment.alreadyHasAccess) {
                 requestRecord.status = 'REJECTED';
                 requestRecord.approval = {
@@ -693,7 +812,26 @@ app.http('SubmitRequest', {
 
                 await saveRequest(requestRecord);
 
-                logRequest(context, 'IAM_REQUEST_ALREADY_HAS_ACCESS', requestRecord);
+                emitLog(
+                    context,
+                    'IAM_REQUEST_ALREADY_HAS_ACCESS',
+                    {
+                        requestId: requestRecord.requestId,
+                        correlationId: requestRecord.correlationId,
+                        requester: requestRecord.requester,
+                        subjectEmail: requestRecord.subject.email,
+                        target: requestRecord.target,
+                        action: requestRecord.action,
+                        requestType: requestRecord.requestType,
+                        status: requestRecord.status,
+                        riskTier: requestRecord.policy.riskTier,
+                        approvalRoute: requestRecord.policy.approvalRoute,
+                        duplicateSignature: requestRecord.duplicateSignature,
+                        alreadyHasAccess: true,
+                        recommendation: entitlementAssessment.recommendation
+                    },
+                    'Warning'
+                );
 
                 return {
                     status: 409,
@@ -707,14 +845,12 @@ app.http('SubmitRequest', {
                 };
             }
 
-            // If a toxic combo is detected, elevate to HIGH and require SECURITY route
             if (entitlementAssessment.conflictDetected) {
                 requestRecord.policy.riskTier = 'HIGH';
                 requestRecord.policy.riskReason = entitlementAssessment.reason;
                 requestRecord.policy.approvalRoute = 'SECURITY';
             }
 
-            // Additional guardrail: if entitlement assessment says target group is not OKTA_GROUP, reject early
             if (
                 entitlementAssessment.targetGroupType &&
                 entitlementAssessment.targetGroupType !== 'OKTA_GROUP'
@@ -733,7 +869,27 @@ app.http('SubmitRequest', {
 
                 await saveRequest(requestRecord);
 
-                logRequest(context, 'IAM_REQUEST_NON_OKTA_GROUP_REJECTED', requestRecord);
+                emitLog(
+                    context,
+                    'IAM_REQUEST_POLICY_REJECTED',
+                    {
+                        requestId: requestRecord.requestId,
+                        correlationId: requestRecord.correlationId,
+                        requester: requestRecord.requester,
+                        subjectEmail: requestRecord.subject.email,
+                        target: requestRecord.target,
+                        action: requestRecord.action,
+                        requestType: requestRecord.requestType,
+                        status: requestRecord.status,
+                        riskTier: requestRecord.policy.riskTier,
+                        approvalRoute: requestRecord.policy.approvalRoute,
+                        duplicateSignature: requestRecord.duplicateSignature,
+                        details: {
+                            reason: `Target group is not OKTA_GROUP: ${entitlementAssessment.targetGroupType}`
+                        }
+                    },
+                    'Warning'
+                );
 
                 return {
                     status: 403,
@@ -761,12 +917,31 @@ app.http('SubmitRequest', {
 
             await saveRequest(requestRecord);
 
-            logRequest(context, 'IAM_REQUEST_ASSESSMENT_FAILED', {
-                requestId: requestRecord.requestId,
-                error: error.message,
-                statusCode: error.status || null,
-                responseBody: error.responseBody || null
-            });
+            emitLog(
+                context,
+                'IAM_REQUEST_ASSESSMENT_FAILED',
+                {
+                    requestId: requestRecord.requestId,
+                    correlationId: requestRecord.correlationId,
+                    requester: requestRecord.requester,
+                    subjectEmail: requestRecord.subject.email,
+                    target: requestRecord.target,
+                    action: requestRecord.action,
+                    requestType: requestRecord.requestType,
+                    status: requestRecord.status,
+                    riskTier: requestRecord.policy.riskTier,
+                    approvalRoute: requestRecord.policy.approvalRoute,
+                    duplicateSignature: requestRecord.duplicateSignature,
+                    provider: 'entitlement-intelligence',
+                    operation: requestRecord.action,
+                    failureType: 'GENERAL_FAILURE',
+                    details: {
+                        error: error.message,
+                        statusCode: error.status || null
+                    }
+                },
+                'Error'
+            );
 
             return {
                 status: 502,
@@ -779,7 +954,6 @@ app.http('SubmitRequest', {
             };
         }
 
-        // LOW → auto-approved only if no entitlement conflict / already-has-access condition
         if (requestRecord.policy.riskTier === 'LOW') {
             requestRecord.status = 'APPROVED';
             requestRecord.approval = {
@@ -792,7 +966,23 @@ app.http('SubmitRequest', {
 
         await saveRequest(requestRecord);
 
-        logRequest(context, 'IAM_REQUEST_CREATED', requestRecord);
+        emitLog(context, 'IAM_REQUEST_CREATED', {
+            requestId: requestRecord.requestId,
+            correlationId: requestRecord.correlationId,
+            requester: requestRecord.requester,
+            subjectEmail: requestRecord.subject.email,
+            target: requestRecord.target,
+            action: requestRecord.action,
+            requestType: requestRecord.requestType,
+            status: requestRecord.status,
+            riskTier: requestRecord.policy.riskTier,
+            approvalRoute: requestRecord.policy.approvalRoute,
+            duplicateSignature: requestRecord.duplicateSignature,
+            duplicateFound: requestRecord.policy.duplicateCheck?.duplicateFound || false,
+            alreadyHasAccess: requestRecord.policy.entitlementAssessment?.alreadyHasAccess || false,
+            conflictDetected: requestRecord.policy.entitlementAssessment?.conflictDetected || false,
+            recommendation: requestRecord.policy.entitlementAssessment?.recommendation || 'PROCEED'
+        });
 
         return {
             status: requestRecord.status === 'APPROVED' ? 200 : 202,
@@ -895,6 +1085,7 @@ app.http('AuditLog', {
                     subject: record.subject,
                     action: record.action,
                     target: record.target,
+                    duplicateSignature: record.duplicateSignature,
                     status: record.status,
                     submittedAt: record.submittedAt,
                     approval: record.approval,
@@ -1008,7 +1199,19 @@ app.http('ApproveRequest', {
 
         await saveRequest(record);
 
-        logRequest(context, 'IAM_REQUEST_APPROVED', record);
+        emitLog(context, 'IAM_REQUEST_APPROVED', {
+            requestId: record.requestId,
+            correlationId: record.correlationId,
+            requester: record.requester,
+            subjectEmail: record.subject?.email || null,
+            target: record.target,
+            action: record.action,
+            requestType: record.requestType,
+            status: record.status,
+            riskTier: record.policy?.riskTier || null,
+            approvalRoute: record.policy?.approvalRoute || null,
+            duplicateSignature: record.duplicateSignature
+        });
 
         return {
             status: 200,
@@ -1092,7 +1295,22 @@ app.http('RejectRequest', {
 
         await saveRequest(record);
 
-        logRequest(context, 'IAM_REQUEST_REJECTED', record);
+        emitLog(context, 'IAM_REQUEST_REJECTED', {
+            requestId: record.requestId,
+            correlationId: record.correlationId,
+            requester: record.requester,
+            subjectEmail: record.subject?.email || null,
+            target: record.target,
+            action: record.action,
+            requestType: record.requestType,
+            status: record.status,
+            riskTier: record.policy?.riskTier || null,
+            approvalRoute: record.policy?.approvalRoute || null,
+            duplicateSignature: record.duplicateSignature,
+            details: {
+                reason
+            }
+        }, 'Warning');
 
         return {
             status: 200,
@@ -1128,7 +1346,6 @@ app.http('ExecuteRequest', {
         }
 
         const requestId = body?.requestId;
-        context.log('EXECUTE START', requestId);
 
         if (!requestId) {
             return {
@@ -1151,6 +1368,22 @@ app.http('ExecuteRequest', {
                 }
             };
         }
+
+        emitLog(context, 'IAM_EXECUTE_START', {
+            requestId: record.requestId,
+            correlationId: record.correlationId,
+            requester: record.requester,
+            subjectEmail: record.subject?.email || null,
+            target: record.target,
+            action: record.action,
+            requestType: record.requestType,
+            status: record.status,
+            riskTier: record.policy?.riskTier || null,
+            approvalRoute: record.policy?.approvalRoute || null,
+            duplicateSignature: record.duplicateSignature,
+            provider: 'okta',
+            operation: record.action
+        });
 
         if (record.status !== 'APPROVED') {
             return {
@@ -1203,10 +1436,6 @@ app.http('ExecuteRequest', {
             };
         }
 
-        if (record.policy?.riskTier === 'HIGH') {
-            context.log(`HIGH RISK EXECUTION requestId=${requestId} target=${record.target}`);
-        }
-
         const targetGuardrails = evaluateTargetGuardrails(record.target);
         record.policy = record.policy || {};
         record.policy.targetEvaluation = targetGuardrails.policyResult;
@@ -1225,6 +1454,25 @@ app.http('ExecuteRequest', {
             };
 
             await saveRequest(record);
+
+            emitLog(context, 'IAM_REQUEST_POLICY_REJECTED', {
+                requestId: record.requestId,
+                correlationId: record.correlationId,
+                requester: record.requester,
+                subjectEmail: record.subject?.email || null,
+                target: record.target,
+                action: record.action,
+                requestType: record.requestType,
+                status: record.status,
+                riskTier: record.policy?.riskTier || null,
+                approvalRoute: record.policy?.approvalRoute || null,
+                duplicateSignature: record.duplicateSignature,
+                provider: 'okta',
+                operation: 'ADD_USER_TO_GROUP',
+                details: {
+                    reason: targetGuardrails.reason
+                }
+            }, 'Warning');
 
             return {
                 status: 403,
@@ -1268,6 +1516,25 @@ app.http('ExecuteRequest', {
 
                 await saveRequest(record);
 
+                emitLog(context, 'IAM_REQUEST_POLICY_REJECTED', {
+                    requestId: record.requestId,
+                    correlationId: record.correlationId,
+                    requester: record.requester,
+                    subjectEmail: record.subject?.email || null,
+                    target: record.target,
+                    action: record.action,
+                    requestType: record.requestType,
+                    status: record.status,
+                    riskTier: record.policy?.riskTier || null,
+                    approvalRoute: record.policy?.approvalRoute || null,
+                    duplicateSignature: record.duplicateSignature,
+                    provider: 'okta',
+                    operation: 'ADD_USER_TO_GROUP',
+                    details: {
+                        reason: `Target group is not OKTA_GROUP: ${group.type}`
+                    }
+                }, 'Warning');
+
                 return {
                     status: 403,
                     jsonBody: {
@@ -1304,7 +1571,26 @@ app.http('ExecuteRequest', {
 
                 await saveRequest(record);
 
-                logRequest(context, 'IAM_REQUEST_VERIFICATION_FAILED', record);
+                emitLog(context, 'IAM_REQUEST_VERIFICATION_FAILED', {
+                    requestId: record.requestId,
+                    correlationId: record.correlationId,
+                    requester: record.requester,
+                    subjectEmail: record.subject?.email || null,
+                    target: record.target,
+                    action: record.action,
+                    requestType: record.requestType,
+                    status: record.status,
+                    riskTier: record.policy?.riskTier || null,
+                    approvalRoute: record.policy?.approvalRoute || null,
+                    duplicateSignature: record.duplicateSignature,
+                    provider: 'okta',
+                    operation: 'ADD_USER_TO_GROUP',
+                    verified: false,
+                    details: {
+                        oktaUserId,
+                        oktaGroupId
+                    }
+                }, 'Error');
 
                 return {
                     status: 502,
@@ -1332,7 +1618,26 @@ app.http('ExecuteRequest', {
 
             await saveRequest(record);
 
-            logRequest(context, 'IAM_REQUEST_EXECUTED', record);
+            emitLog(context, 'IAM_REQUEST_EXECUTED', {
+                requestId: record.requestId,
+                correlationId: record.correlationId,
+                requester: record.requester,
+                subjectEmail: record.subject?.email || null,
+                target: record.target,
+                action: record.action,
+                requestType: record.requestType,
+                status: record.status,
+                riskTier: record.policy?.riskTier || null,
+                approvalRoute: record.policy?.approvalRoute || null,
+                duplicateSignature: record.duplicateSignature,
+                provider: 'okta',
+                operation: 'ADD_USER_TO_GROUP',
+                verified: true,
+                details: {
+                    oktaUserId,
+                    oktaGroupId
+                }
+            });
 
             return {
                 status: 200,
@@ -1368,13 +1673,26 @@ app.http('ExecuteRequest', {
 
             await saveRequest(record);
 
-            logRequest(context, 'IAM_REQUEST_EXECUTION_FAILED', {
-                requestId,
+            emitLog(context, 'IAM_REQUEST_EXECUTION_FAILED', {
+                requestId: record.requestId,
+                correlationId: record.correlationId,
+                requester: record.requester,
+                subjectEmail: record.subject?.email || null,
+                target: record.target,
+                action: record.action,
+                requestType: record.requestType,
+                status: record.status,
+                riskTier: record.policy?.riskTier || null,
+                approvalRoute: record.policy?.approvalRoute || null,
+                duplicateSignature: record.duplicateSignature,
+                provider: 'okta',
+                operation: 'ADD_USER_TO_GROUP',
                 failureType,
-                error: error.message,
-                statusCode: error.status || null,
-                responseBody: error.responseBody || null
-            });
+                details: {
+                    error: error.message,
+                    statusCode: error.status || null
+                }
+            }, 'Error');
 
             return {
                 status: 502,

@@ -2,7 +2,8 @@
   "name": "iam-api",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "src/index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "func start",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -10,7 +11,6 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "@azure/data-tables": "^13.3.2",
     "@azure/functions": "^4.16.1",
