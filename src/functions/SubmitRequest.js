@@ -1,6 +1,8 @@
 const { app } = require('@azure/functions');
 const { TableClient } = require('@azure/data-tables');
 const { saveRequest, getRequest } = require('../storage/approvalStore');
+const { executeWithControl } = require('../execution-control/executionControlRouter');
+const { verifyAndRollbackIfNeeded } = require('../execution-control/verificationRouter');
 
 // ==============================
 // LOCAL TABLE ACCESS (for duplicate request detection)
@@ -119,7 +121,7 @@ function emitLog(context, eventName, fields = {}, severity = 'Information') {
 // DUPLICATE REQUEST DETECTION
 // Query by persisted duplicateSignature + open statuses.
 // ==============================
-async function findDuplicateOpenRequest(duplicateSignature, context) {
+async function findDuplicateOpenRequest(duplicateSignature) {
     const openStatuses = new Set(['PENDING_APPROVAL', 'APPROVED']);
 
     const entities = requestsTableClient.listEntities({
@@ -489,19 +491,6 @@ async function getUserGroups(oktaUserId, context) {
     return Array.isArray(groups) ? groups : [];
 }
 
-async function assignUserToGroup(oktaUserId, oktaGroupId, context) {
-    await oktaRequest(
-        'PUT',
-        `/api/v1/groups/${encodeURIComponent(oktaGroupId)}/users/${encodeURIComponent(oktaUserId)}`,
-        { retry: false, context }
-    );
-}
-
-async function verifyUserGroupMembership(oktaUserId, oktaGroupId, context) {
-    const groups = await getUserGroups(oktaUserId, context);
-    return groups.some(g => g?.id === oktaGroupId);
-}
-
 // ==============================
 // ENTITLEMENT INTELLIGENCE
 // ==============================
@@ -655,12 +644,10 @@ app.http('SubmitRequest', {
             action: body.requestedAction.actionType,
             target: body.target.targetIdentifier,
             submittedAt: new Date().toISOString(),
-
             duplicateSignature,
-
             approval: null,
             execution: null,
-
+            rollback: null,
             policy: {
                 requestedBy: caller,
                 riskTier: null,
@@ -670,7 +657,6 @@ app.http('SubmitRequest', {
                 duplicateCheck: null,
                 entitlementAssessment: null
             },
-
             oktaUserId: null,
             oktaGroupId: null,
             verification: null
@@ -688,7 +674,7 @@ app.http('SubmitRequest', {
             duplicateSignature: requestRecord.duplicateSignature
         });
 
-        const duplicate = await findDuplicateOpenRequest(duplicateSignature, context);
+        const duplicate = await findDuplicateOpenRequest(duplicateSignature);
 
         requestRecord.policy.duplicateCheck = {
             duplicateFound: !!duplicate,
@@ -1010,7 +996,7 @@ app.http('RequestStatus', {
     authLevel: 'function',
     route: 'RequestStatus',
 
-    handler: async (request, context) => {
+    handler: async (request) => {
         const requestId = request.query.get('requestId');
 
         if (!requestId) {
@@ -1050,7 +1036,7 @@ app.http('AuditLog', {
     authLevel: 'function',
     route: 'AuditLog',
 
-    handler: async (request, context) => {
+    handler: async (request) => {
         const requestId = request.query.get('requestId');
 
         if (!requestId) {
@@ -1090,8 +1076,9 @@ app.http('AuditLog', {
                     submittedAt: record.submittedAt,
                     approval: record.approval,
                     execution: record.execution,
-                    policy: record.policy,
                     verification: record.verification,
+                    rollback: record.rollback || null,
+                    policy: record.policy,
                     oktaUserId: record.oktaUserId,
                     oktaGroupId: record.oktaGroupId
                 }
@@ -1381,7 +1368,7 @@ app.http('ExecuteRequest', {
             riskTier: record.policy?.riskTier || null,
             approvalRoute: record.policy?.approvalRoute || null,
             duplicateSignature: record.duplicateSignature,
-            provider: 'okta',
+            provider: 'ecl',
             operation: record.action
         });
 
@@ -1444,9 +1431,9 @@ app.http('ExecuteRequest', {
             record.status = 'POLICY_REJECTED';
             record.execution = {
                 executor: 'system',
-                provider: 'okta',
-                operation: 'ADD_USER_TO_GROUP',
-                subjectEmail: record.subject.email,
+                provider: 'policy-engine',
+                operation: record.action,
+                subjectEmail: record.subject?.email || null,
                 result: 'BLOCKED',
                 policyResult: targetGuardrails.policyResult,
                 error: targetGuardrails.reason,
@@ -1467,8 +1454,8 @@ app.http('ExecuteRequest', {
                 riskTier: record.policy?.riskTier || null,
                 approvalRoute: record.policy?.approvalRoute || null,
                 duplicateSignature: record.duplicateSignature,
-                provider: 'okta',
-                operation: 'ADD_USER_TO_GROUP',
+                provider: 'policy-engine',
+                operation: record.action,
                 details: {
                     reason: targetGuardrails.reason
                 }
@@ -1484,196 +1471,127 @@ app.http('ExecuteRequest', {
             };
         }
 
-        try {
-            const oktaUserId =
-                record.oktaUserId ||
-                (await resolveOktaUserIdFromSubjectEmail(record.subject.email, context));
+        // ==============================
+        // EXECUTION CONTROL LAYER
+        // ==============================
+        const controlled = await executeWithControl(record, context);
 
-            const group =
-                record.policy?.entitlementAssessment?.oktaGroupId
-                    ? {
-                        id: record.policy.entitlementAssessment.oktaGroupId,
-                        name: record.policy.entitlementAssessment.targetGroupName || record.target,
-                        type: record.policy.entitlementAssessment.targetGroupType || null
-                    }
-                    : await resolveOktaGroupFromTargetName(record.target, context);
-
-            const oktaGroupId = group.id;
-
-            if (group.type && group.type !== 'OKTA_GROUP') {
-                record.status = 'POLICY_REJECTED';
-                record.execution = {
-                    executor: 'system',
-                    provider: 'okta',
-                    operation: 'ADD_USER_TO_GROUP',
-                    subjectEmail: record.subject.email,
-                    target: record.target,
-                    result: 'BLOCKED',
-                    policyResult: 'NON_OKTA_GROUP',
-                    error: `Target group is not OKTA_GROUP: ${group.type}`,
-                    executedAt: new Date().toISOString()
-                };
-
-                await saveRequest(record);
-
-                emitLog(context, 'IAM_REQUEST_POLICY_REJECTED', {
-                    requestId: record.requestId,
-                    correlationId: record.correlationId,
-                    requester: record.requester,
-                    subjectEmail: record.subject?.email || null,
-                    target: record.target,
-                    action: record.action,
-                    requestType: record.requestType,
-                    status: record.status,
-                    riskTier: record.policy?.riskTier || null,
-                    approvalRoute: record.policy?.approvalRoute || null,
-                    duplicateSignature: record.duplicateSignature,
-                    provider: 'okta',
-                    operation: 'ADD_USER_TO_GROUP',
-                    details: {
-                        reason: `Target group is not OKTA_GROUP: ${group.type}`
-                    }
-                }, 'Warning');
-
-                return {
-                    status: 403,
-                    jsonBody: {
-                        status: 'POLICY_REJECTED',
-                        requestId,
-                        reason: `Target group is not OKTA_GROUP: ${group.type}`
-                    }
-                };
-            }
-
-            await assignUserToGroup(oktaUserId, oktaGroupId, context);
-
-            const verified = await verifyUserGroupMembership(oktaUserId, oktaGroupId, context);
-
-            record.oktaUserId = oktaUserId;
-            record.oktaGroupId = oktaGroupId;
-            record.verification = {
-                verified,
-                checkedAt: new Date().toISOString()
-            };
-
-            if (!verified) {
-                record.status = 'VERIFICATION_FAILED';
-                record.execution = {
-                    executor: 'system',
-                    provider: 'okta',
-                    operation: 'ADD_USER_TO_GROUP',
-                    subjectEmail: record.subject.email,
-                    oktaUserId,
-                    oktaGroupId,
-                    result: 'EXECUTED_BUT_NOT_VERIFIED',
-                    executedAt: new Date().toISOString()
-                };
-
-                await saveRequest(record);
-
-                emitLog(context, 'IAM_REQUEST_VERIFICATION_FAILED', {
-                    requestId: record.requestId,
-                    correlationId: record.correlationId,
-                    requester: record.requester,
-                    subjectEmail: record.subject?.email || null,
-                    target: record.target,
-                    action: record.action,
-                    requestType: record.requestType,
-                    status: record.status,
-                    riskTier: record.policy?.riskTier || null,
-                    approvalRoute: record.policy?.approvalRoute || null,
-                    duplicateSignature: record.duplicateSignature,
-                    provider: 'okta',
-                    operation: 'ADD_USER_TO_GROUP',
-                    verified: false,
-                    details: {
-                        oktaUserId,
-                        oktaGroupId
-                    }
-                }, 'Error');
-
-                return {
-                    status: 502,
-                    jsonBody: {
-                        status: 'VERIFICATION_FAILED',
-                        requestId,
-                        subjectEmail: record.subject.email,
-                        oktaUserId,
-                        oktaGroupId
-                    }
-                };
-            }
-
-            record.status = 'EXECUTED';
+        if (controlled.blocked) {
+            record.status = 'POLICY_REJECTED';
             record.execution = {
-                executor: 'system',
-                provider: 'okta',
-                operation: 'ADD_USER_TO_GROUP',
-                subjectEmail: record.subject.email,
-                oktaUserId,
-                oktaGroupId,
-                result: 'SUCCESS',
-                executedAt: new Date().toISOString()
+                executor: 'execution-control-layer',
+                provider: 'ecl',
+                operation: record.action,
+                subjectEmail: record.subject?.email || null,
+                result: 'BLOCKED',
+                error: controlled.decision.reason,
+                executedAt: new Date().toISOString(),
+                details: {
+                    decision: controlled.decision
+                }
             };
 
             await saveRequest(record);
-
-            emitLog(context, 'IAM_REQUEST_EXECUTED', {
-                requestId: record.requestId,
-                correlationId: record.correlationId,
-                requester: record.requester,
-                subjectEmail: record.subject?.email || null,
-                target: record.target,
-                action: record.action,
-                requestType: record.requestType,
-                status: record.status,
-                riskTier: record.policy?.riskTier || null,
-                approvalRoute: record.policy?.approvalRoute || null,
-                duplicateSignature: record.duplicateSignature,
-                provider: 'okta',
-                operation: 'ADD_USER_TO_GROUP',
-                verified: true,
-                details: {
-                    oktaUserId,
-                    oktaGroupId
-                }
-            });
 
             return {
-                status: 200,
+                status: 403,
                 jsonBody: {
-                    status: 'EXECUTED',
-                    requestId,
-                    provider: 'okta',
-                    subjectEmail: record.subject.email,
-                    oktaUserId,
-                    oktaGroupId,
-                    verified: true
+                    status: 'POLICY_REJECTED',
+                    requestId: record.requestId,
+                    correlationId: record.correlationId,
+                    reason: controlled.decision.reason,
+                    actionFamily: controlled.decision.actionFamily
                 }
             };
-        } catch (error) {
-            const failureType =
-                error.status === 404 ? 'NOT_FOUND' :
-                error.status === 403 ? 'ACCESS_DENIED' :
-                error.status === 429 ? 'RATE_LIMIT' :
-                'GENERAL_FAILURE';
+        }
 
-            record.status = 'EXECUTION_FAILED';
+        if (controlled.simulated) {
+            record.status = 'SIMULATION_ONLY';
             record.execution = {
-                executor: 'system',
-                provider: 'okta',
-                operation: 'ADD_USER_TO_GROUP',
+                executor: 'execution-control-layer',
+                provider: 'ecl',
+                operation: record.action,
                 subjectEmail: record.subject?.email || null,
-                result: 'FAILED',
-                failureType,
-                error: error.message,
-                statusCode: error.status || null,
-                executedAt: new Date().toISOString()
+                result: 'SIMULATED',
+                executedAt: new Date().toISOString(),
+                details: {
+                    decision: controlled.decision,
+                    result: controlled.result
+                }
             };
 
             await saveRequest(record);
 
-            emitLog(context, 'IAM_REQUEST_EXECUTION_FAILED', {
+            return {
+                status: 202,
+                jsonBody: {
+                    status: 'SIMULATION_ONLY',
+                    requestId: record.requestId,
+                    correlationId: record.correlationId,
+                    decision: controlled.decision,
+                    result: controlled.result
+                }
+            };
+        }
+
+        if (controlled.error) {
+            record.status = 'EXECUTION_FAILED';
+            record.execution = {
+                executor: 'execution-control-layer',
+                provider: 'ecl',
+                operation: record.action,
+                subjectEmail: record.subject?.email || null,
+                result: 'FAILED',
+                failureType: controlled.error.failureClass || 'GENERAL_FAILURE',
+                error: controlled.error.details?.message || 'Execution control layer failure',
+                executedAt: new Date().toISOString(),
+                details: controlled.error
+            };
+
+            await saveRequest(record);
+
+            return {
+                status: 502,
+                jsonBody: {
+                    status: 'EXECUTION_FAILED',
+                    requestId: record.requestId,
+                    correlationId: record.correlationId,
+                    failure: controlled.error
+                }
+            };
+        }
+
+        // ==============================
+        // VERIFICATION + ROLLBACK LAYER
+        // ==============================
+        const verificationFlow = await verifyAndRollbackIfNeeded(record, controlled.result, context);
+
+        record.verification = verificationFlow.verification || null;
+        if (verificationFlow.rollback) {
+            record.rollback = verificationFlow.rollback;
+        }
+
+        if (verificationFlow.verification?.verified === false) {
+            record.status = verificationFlow.rollback?.rolledBack
+                ? 'ROLLED_BACK'
+                : 'VERIFICATION_FAILED';
+
+            record.execution = {
+                executor: 'execution-control-layer',
+                provider: 'ecl',
+                operation: record.action,
+                subjectEmail: record.subject?.email || null,
+                result: controlled.result?.executionState || 'SUCCESS',
+                executedAt: new Date().toISOString(),
+                details: {
+                    decision: controlled.decision,
+                    result: controlled.result
+                }
+            };
+
+            await saveRequest(record);
+
+            emitLog(context, 'IAM_REQUEST_VERIFICATION_FAILED', {
                 requestId: record.requestId,
                 correlationId: record.correlationId,
                 requester: record.requester,
@@ -1685,24 +1603,76 @@ app.http('ExecuteRequest', {
                 riskTier: record.policy?.riskTier || null,
                 approvalRoute: record.policy?.approvalRoute || null,
                 duplicateSignature: record.duplicateSignature,
-                provider: 'okta',
-                operation: 'ADD_USER_TO_GROUP',
-                failureType,
+                provider: 'verification-rollback',
+                operation: record.action,
+                verified: false,
                 details: {
-                    error: error.message,
-                    statusCode: error.status || null
+                    verification: verificationFlow.verification,
+                    rollback: verificationFlow.rollback || null
                 }
             }, 'Error');
 
             return {
                 status: 502,
                 jsonBody: {
-                    status: 'EXECUTION_FAILED',
-                    requestId,
-                    failureType,
-                    reason: error.message
+                    status: record.status,
+                    requestId: record.requestId,
+                    correlationId: record.correlationId,
+                    verification: verificationFlow.verification,
+                    rollback: verificationFlow.rollback || null
                 }
             };
         }
+
+        record.status = 'EXECUTED';
+        record.execution = {
+            executor: 'execution-control-layer',
+            provider: 'ecl',
+            operation: record.action,
+            subjectEmail: record.subject?.email || null,
+            result: controlled.result?.executionState || 'SUCCESS',
+            executedAt: new Date().toISOString(),
+            details: {
+                decision: controlled.decision,
+                result: controlled.result
+            }
+        };
+
+        await saveRequest(record);
+
+        emitLog(context, 'IAM_REQUEST_EXECUTED', {
+            requestId: record.requestId,
+            correlationId: record.correlationId,
+            requester: record.requester,
+            subjectEmail: record.subject?.email || null,
+            target: record.target,
+            action: record.action,
+            requestType: record.requestType,
+            status: record.status,
+            riskTier: record.policy?.riskTier || null,
+            approvalRoute: record.policy?.approvalRoute || null,
+            duplicateSignature: record.duplicateSignature,
+            provider: 'ecl',
+            operation: record.action,
+            verified: record.verification?.verified ?? null,
+            details: {
+                decision: controlled.decision,
+                result: controlled.result,
+                verification: record.verification
+            }
+        });
+
+        return {
+            status: 200,
+            jsonBody: {
+                status: 'EXECUTED',
+                requestId: record.requestId,
+                correlationId: record.correlationId,
+                decision: controlled.decision,
+                result: controlled.result,
+                verification: record.verification,
+                rollback: record.rollback || null
+            }
+        };
     }
 });

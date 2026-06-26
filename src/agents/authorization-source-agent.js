@@ -1,6 +1,6 @@
 const axios = require('axios');
-const { ORG_URL, API_TOKEN, AUTHZ_GROUPS } = require('./config');
-const { log } = require('./logger');
+const { ORG_URL, API_TOKEN, AUTHZ_GROUPS } = require('../utils/config');
+const { log } = require('../utils/logger');
 
 const headers = {
     Authorization: `SSWS ${API_TOKEN}`,
@@ -18,8 +18,14 @@ async function getUserByLogin(login) {
     });
 
     if (response.status !== 200) {
-        const summary = response.data?.errorSummary || response.statusText || 'Unknown error';
-        throw new Error(`GET requester user failed: ${response.status} ${summary}`);
+        const summary =
+            response.data?.errorSummary ||
+            response.statusText ||
+            'Unknown error';
+
+        throw new Error(
+            `GET requester user failed: ${response.status} ${summary}`
+        );
     }
 
     return response.data;
@@ -35,15 +41,21 @@ async function listRequesterGroups(userId) {
     });
 
     if (response.status !== 200) {
-        const summary = response.data?.errorSummary || response.statusText || 'Unknown error';
-        throw new Error(`GET requester groups failed: ${response.status} ${summary}`);
+        const summary =
+            response.data?.errorSummary ||
+            response.statusText ||
+            'Unknown error';
+
+        throw new Error(
+            `GET requester groups failed: ${response.status} ${summary}`
+        );
     }
 
     return Array.isArray(response.data) ? response.data : [];
 }
 
 async function getRequesterCapabilitiesFromSource(requester) {
-    log("AUTHZSRC", "START", `requester=${requester}`);
+    log('AUTHZSRC', 'START', `requester=${requester}`);
 
     const user = await getUserByLogin(requester);
     const groups = await listRequesterGroups(user.id);
@@ -66,7 +78,11 @@ async function getRequesterCapabilitiesFromSource(requester) {
         capabilities.push('SUBMIT_HIGH_RISK');
     }
 
-    log("AUTHZSRC", "SUCCESS", `capabilities=${capabilities.join(',') || 'none'}`);
+    log(
+        'AUTHZSRC',
+        'SUCCESS',
+        `capabilities=${capabilities.join(',') || 'none'}`
+    );
 
     return {
         requester,
@@ -76,5 +92,6 @@ async function getRequesterCapabilitiesFromSource(requester) {
     };
 }
 
-module.exports = { getRequesterCapabilitiesFromSource };
-``
+module.exports = {
+    getRequesterCapabilitiesFromSource
+};
