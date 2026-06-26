@@ -1,3 +1,5 @@
+require('dotenv').config(); // ✅ THIS IS THE FIX
+
 const express = require('express');
 
 // Thin composition only:
@@ -9,7 +11,9 @@ const intakeRoutes = require('./routes/intake_form_routes');
 const app = express();
 app.use(express.json());
 
-// Simple health check
+// ==============================
+// ✅ HEALTH CHECK
+// ==============================
 app.get('/health', (_req, res) => {
     res.status(200).json({
         status: 'ok',
@@ -18,10 +22,14 @@ app.get('/health', (_req, res) => {
     });
 });
 
-// Mount feature routes under /api
+// ==============================
+// ✅ ROUTES
+// ==============================
 app.use('/api', intakeRoutes);
 
-// Centralized error handler
+// ==============================
+// ✅ ERROR HANDLER
+// ==============================
 app.use((err, _req, res, _next) => {
     console.error(err);
 
@@ -33,7 +41,9 @@ app.use((err, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 3000);
 
-// Only listen when this file is run directly with `node src/server.js`
+// ==============================
+// ✅ START SERVER
+// ==============================
 if (require.main === module) {
     app.listen(port, () => {
         console.log(`IAM API local server running on port ${port}`);
