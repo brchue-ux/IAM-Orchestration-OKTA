@@ -1,88 +1,89 @@
+"use strict";
 
-'use strict';
+/**
+ * requestEventStore
+ *
+ * Temporary lightweight event store that writes audit/request events to a
+ * local JSONL file. This removes the hard dependency on a SQL pool during
+ * startup so the server, scheduler, and control-plane endpoints can run.
+ *
+ * One JSON object is appended per line to support simple troubleshooting,
+ * audit review, and later migration back to a database-backed store.
+ */
 
-const sql = require('mssql');
+const fs = require("fs");
+const path = require("path");
 
-async function getPool() {
-    return sql.connect();
+const STORE_DIR = path.resolve(process.cwd(), ".request-store");
+const EVENTS_FILE = path.join(STORE_DIR, "request-events.jsonl");
+
+function ensureStore() {
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+
+    if (!fs.existsSync(EVENTS_FILE)) {
+        fs.writeFileSync(EVENTS_FILE, "", "utf8");
+    }
 }
 
-async function ensureEventSchema() {
-    const pool = await getPool();
-
-    await pool.request().query(`
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name = 'IamRequestEvents' AND xtype = 'U')
-        CREATE TABLE IamRequestEvents (
-            event_id INT IDENTITY(1,1) PRIMARY KEY,
-            correlation_id NVARCHAR(100) NOT NULL,
-            event_name NVARCHAR(100) NOT NULL,
-            from_status NVARCHAR(100) NULL,
-            to_status NVARCHAR(100) NULL,
-            actor NVARCHAR(255) NULL,
-            event_details NVARCHAR(MAX) NULL,
-            created_timestamp DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
-        );
-    `);
+function sanitizeEvent(event) {
+    return {
+        correlation_id: event && event.correlation_id ? event.correlation_id : null,
+        event_name: event && event.event_name ? event.event_name : "UNKNOWN_EVENT",
+        actor: event && event.actor ? event.actor : "unknown",
+        severity: event && event.severity ? event.severity : "info",
+        category: event && event.category ? event.category : "runtime",
+        message: event && event.message ? event.message : null,
+        logged_at: event && event.logged_at ? event.logged_at : new Date().toISOString(),
+        details: event && event.details ? event.details : null,
+        error: event && event.error
+            ? {
+                name: event.error.name || "Error",
+                message: event.error.message || String(event.error),
+                stack: event.error.stack || null
+            }
+            : null
+    };
 }
 
 /**
- * Append a structured request event.
+ * Append one event record to the local JSONL file.
  */
-async function appendRequestEvent(event = {}) {
-    await ensureEventSchema();
-    const pool = await getPool();
+async function appendRequestEvent(event) {
+    ensureStore();
 
-    const details = event.event_details ? JSON.stringify(event.event_details) : null;
+    const record = sanitizeEvent(event || {});
+    const line = JSON.stringify(record) + "\n";
 
-    await pool.request()
-        .input('correlation_id', event.correlation_id)
-        .input('event_name', event.event_name)
-        .input('from_status', event.from_status || null)
-        .input('to_status', event.to_status || null)
-        .input('actor', event.actor || 'SYSTEM')
-        .input('event_details', details)
-        .query(`
-            INSERT INTO IamRequestEvents (
-                correlation_id,
-                event_name,
-                from_status,
-                to_status,
-                actor,
-                event_details,
-                created_timestamp
-            ) VALUES (
-                @correlation_id,
-                @event_name,
-                @from_status,
-                @to_status,
-                @actor,
-                @event_details,
-                SYSUTCDATETIME()
-            );
-        `);
+    await fs.promises.appendFile(EVENTS_FILE, line, "utf8");
+    return record;
 }
 
 /**
- * Retrieve request events for one correlation ID.
+ * Read recent request events from the local JSONL file.
  */
-async function getRequestEventsByCorrelationId(correlationId) {
-    await ensureEventSchema();
-    const pool = await getPool();
+async function listRequestEvents(options) {
+    ensureStore();
 
-    const result = await pool.request()
-        .input('correlation_id', correlationId)
-        .query(`
-            SELECT *
-            FROM IamRequestEvents
-            WHERE correlation_id = @correlation_id
-            ORDER BY event_id ASC
-        `);
+    const limit = Number(options && options.limit ? options.limit : 200);
+    const raw = await fs.promises.readFile(EVENTS_FILE, "utf8");
 
-    return result.recordset;
+    const rows = raw
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map(function parseLine(line) {
+            try {
+                return JSON.parse(line);
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean);
+
+    return rows.slice(-limit).reverse();
 }
 
 module.exports = {
-    ensureEventSchema,
+    EVENTS_FILE,
     appendRequestEvent,
-    getRequestEventsByCorrelationId
+    listRequestEvents
 };

@@ -1,149 +1,152 @@
 "use strict";
 
 /**
- * Multi-agent orchestrator.
- * Handles intake, policy checks, routing, approval, execution, verification, and completion synthesis.
+ * Multi-agent orchestrator with:
+ * ✅ verification-driven completion
+ * ✅ request lifecycle persistence
+ * ✅ runbook + rollback integration
  */
 
-const { normalizeRequestEnvelope, validateRequiredFields } = require("../contracts/requestEnvelope");
-const { buildSodDecision } = require("../policy/sodPolicyEngine");
-const { buildBlastRadiusDecision } = require("../policy/blastRadiusGuard");
-const { requestApproval } = require("../agents/approvalAgent");
-const readOnlyStatusAgent = require("../agents/readOnlyStatusAgent");
-const groupFulfillmentAgent = require("../agents/groupFulfillmentAgent");
-const userLifecycleStateAgent = require("../agents/userLifecycleStateAgent");
+const {
+    createRequest,
+    updateRequest,
+    getRequestByCorrelationId
+} = require("../services/requestRegistryStore");
+
+const { verify } = require("../agents/verificationReadBackAgent");
 const { buildCompletionResponse } = require("../agents/completionSupportAgent");
+const { executeRunbook } = require("../services/runbookExecutionService");
 
-function classifyRisk(request) {
-    if (String(request.target_group_type || "").toLowerCase() === "privileged") {
-        return "high";
-    }
-
-    const family = String(request.action_family || "").toLowerCase();
-
-    if (["privileged_access", "session_containment", "policy_security_change"].includes(family)) {
-        return "high";
-    }
-
-    if (["user_lifecycle", "app_assignment"].includes(family)) {
-        return "moderate";
-    }
-
-    return request.risk_tier || "low";
+function normalizeText(value) {
+    return String(value || "").trim().toLowerCase();
 }
 
-function selectExecutionAgent(request) {
-    const family = String(request.action_family || "").toLowerCase();
+/**
+ * ✅ REQUEST STORE HELPER
+ */
+async function upsertLifecycleRecord(request, patch) {
+    if (!request || !request.correlation_id) return;
 
-    if (family === "read_only_lookup") {
-        return readOnlyStatusAgent;
-    }
+    const existing = getRequestByCorrelationId(request.correlation_id);
 
-    if (family === "group_fulfillment") {
-        return groupFulfillmentAgent;
-    }
-
-    if (family === "user_lifecycle") {
-        return userLifecycleStateAgent;
-    }
-
-    return null;
-}
-
-async function verifyExecution(request, execution) {
-    if (execution.execution_state !== "SUCCESS") {
-        return {
-            verification_result: "verified_failure",
-            verification_method: "execution_state_check"
-        };
-    }
-
-    return {
-        verification_result: "verified_success",
-        verification_method: "simulation_read_back_check"
-    };
-}
-
-async function routeRequest(input, config) {
-    const request = normalizeRequestEnvelope(input);
-    request.risk_tier = classifyRisk(request);
-
-    const requiredCheck = validateRequiredFields(request);
-    if (!requiredCheck.isValid) {
-        return {
-            correlation_id: request.correlation_id,
-            status: "needs_clarification",
-            policy_decision: "manual_review",
-            reasons: [`Missing required fields: ${requiredCheck.missing.join(', ')}.`],
-            message: "Request requires clarification or manual review before approval / execution."
-        };
-    }
-
-    const sodDecision = buildSodDecision(request);
-    if (!sodDecision.passed) {
-        return {
-            correlation_id: request.correlation_id,
-            status: "rejected",
-            policy_decision: sodDecision.policy_decision,
-            reasons: sodDecision.reasons,
-            message: "Request rejected due to separation-of-duties controls."
-        };
-    }
-
-    const blastDecision = buildBlastRadiusDecision(request, config || {});
-    if (!blastDecision.passed) {
-        return {
-            correlation_id: request.correlation_id,
-            status: "rejected",
-            policy_decision: blastDecision.policy_decision,
-            reasons: blastDecision.reasons,
-            message: "Request rejected due to blast-radius controls."
-        };
-    }
-
-    const requiresApproval = request.risk_tier === "high" || String(request.action_family).toLowerCase() !== "read_only_lookup";
-    let approval = null;
-
-    if (requiresApproval && !request.approval_record) {
-        approval = await requestApproval(request);
-        return {
-            correlation_id: request.correlation_id,
-            status: "approval_pending",
-            policy_decision: "approval_required",
-            approval: approval,
-            message: `Approval is required before execution. Reference ID: ${request.correlation_id}.`
-        };
-    }
-
-    const executionAgent = selectExecutionAgent(request);
-    if (!executionAgent) {
-        return {
-            correlation_id: request.correlation_id,
-            status: "manual_review",
-            policy_decision: "manual_review",
-            reasons: ["No execution agent is mapped for the requested action family."],
-            message: "Request requires manual review because no bounded execution path is configured."
-        };
-    }
-
-    const execution = await executionAgent.execute(request);
-    const verification = await verifyExecution(request, execution);
-    const completion = buildCompletionResponse(request, execution, verification);
-
-    return {
+    const base = {
         correlation_id: request.correlation_id,
-        status: completion.status,
-        policy_decision: "approved",
-        request: request,
-        execution: execution,
-        verification: verification,
-        completion: completion
+        request_id: request.request_id || request.correlation_id,
+        action_family: request.action_family,
+        target_identity: request.target_identity,
+        target_environment: request.target_environment,
+        risk_tier: request.risk_tier
     };
+
+    if (existing) {
+        return updateRequest(request.correlation_id, {
+            ...existing,
+            ...patch
+        });
+    }
+
+    return createRequest({
+        ...base,
+        ...patch
+    });
+}
+
+/**
+ * ✅ COMPLETION DECISION (STRICT VERIFICATION MODEL)
+ */
+function computeCompletionStatus(verification) {
+    const result = normalizeText(verification.verification_result);
+
+    if (result === "verified_success") return "completed_verified";
+    if (result === "verified_failure") return "failed";
+    if (result === "verification_inconclusive") return "verification_inconclusive";
+    if (result === "verification_pending") return "verification_pending";
+
+    return "manual_review";
+}
+
+function shouldTriggerRunbook(status, verification) {
+    return status !== "completed_verified";
+}
+
+/**
+ * ✅ MAIN ROUTER
+ */
+async function routeRequest(request, executionAgent) {
+
+    // ✅ STEP 1 — intake persistence
+    await upsertLifecycleRecord(request, {
+        current_status: "ready_for_validation",
+        current_step: "REQUEST_NORMALIZED",
+        waiting_on: "validation"
+    });
+
+    /**
+     * ✅ STEP 2 — EXECUTION
+     */
+    const execution = await executionAgent.execute(request);
+
+    await upsertLifecycleRecord(request, {
+        current_status: "execution_completed",
+        current_step: "EXECUTION_COMPLETED",
+        waiting_on: "verification",
+        execution_status: execution.execution_state,
+        details: { execution }
+    });
+
+    /**
+     * ✅ STEP 3 — VERIFICATION (IMPORTANT)
+     */
+    const verification = await verify(request, execution);
+
+    const completionStatus = computeCompletionStatus(verification);
+
+    await upsertLifecycleRecord(request, {
+        current_status: completionStatus,
+        current_step: "VERIFICATION_COMPLETED",
+        waiting_on: completionStatus === "completed_verified" ? null : "operations",
+        verification_result: verification.verification_result,
+        verification_method: verification.verification_method,
+        details: { verification }
+    });
+
+    /**
+     * ✅ STEP 4 — COMPLETION OUTPUT
+     */
+    const completion = buildCompletionResponse(request, execution, {
+        ...verification,
+        completion_status_override: completionStatus
+    });
+
+    const result = {
+        correlation_id: request.correlation_id,
+        status: completionStatus,
+        request,
+        execution,
+        verification,
+        completion
+    };
+
+    /**
+     * ✅ STEP 5 — RUNBOOK (ONLY IF NOT VERIFIED SUCCESS)
+     */
+    if (shouldTriggerRunbook(completionStatus, verification)) {
+
+        const runbookPlan = await executeRunbook(request, result);
+
+        result.runbook_action_plan = runbookPlan;
+
+        await upsertLifecycleRecord(request, {
+            current_status: completionStatus,
+            current_step: "RUNBOOK_EXECUTED",
+            waiting_on: "operations",
+            final_status: completionStatus
+        });
+    }
+
+    return result;
 }
 
 module.exports = {
-    routeRequest,
-    classifyRisk,
-    selectExecutionAgent,
-    verifyExecution
+    routeRequest
 };

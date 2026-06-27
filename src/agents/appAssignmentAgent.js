@@ -1,86 +1,142 @@
-
-'use strict';
-
-/**
- * AppAssignmentAgent
- *
- * Approved application assignment / unassignment agent.
- * This implementation is a governed simulation stub for Wave 2.
- */
-
-function normalizeOperation(request = {}) {
-    const operation = String(request.operation || '').trim().toLowerCase();
-    if (operation === 'assign' || operation === 'unassign') {
-        return operation;
-    }
-
-    const action = String(request.requested_action || '').toLowerCase();
-    if (action.includes('unassign') || action.includes('remove')) {
-        return 'unassign';
-    }
-    return 'assign';
-}
-
-function validateRequest(request = {}) {
-    const missing = [];
-    if (!request.target_identity && !request.target_user_identifier) missing.push('target_identity');
-    if (!request.app_identifier && !request.target_resource) missing.push('app_identifier');
-    if (!request.expected_postcondition) missing.push('expected_postcondition');
-    return missing;
-}
+"use strict";
 
 /**
- * Execute approved app assignment in simulation mode.
- *
- * @param {object} request Normalized request object.
- * @param {object} context Optional runtime context.
- * @returns {object} Execution decision and result bundle.
+ * App assignment agent.
+ * Bounded to approved, low-risk application assignment changes.
  */
-async function execute(request = {}, context = {}) {
-    if (context?.log) {
-        context.log('AppAssignmentAgent: execution started');
+
+const oktaClient = require("../connectors/oktaClient");
+const { isAppAllowed } = require("../config/executionPolicyConfig");
+const { executeWithRetry } = require("../services/retryPolicy");
+const { classifyError } = require("../utils/errorClassification");
+const { logAuditEvent } = require("../services/auditLogger");
+const { incrementCounter } = require("../services/metricsCollector");
+
+function normalizeOperation(value) {
+    return String(value || "").trim().toLowerCase();
+}
+
+async function executeCore(request) {
+    const operation = normalizeOperation(request.operation);
+
+    if (typeof oktaClient.assignUserToApp === "function" && operation === "assign") {
+        return oktaClient.assignUserToApp(request.app_id, request.target_identity);
     }
 
-    const missing = validateRequest(request);
-    if (missing.length > 0) {
-        return {
-            allowed: false,
-            executionResult: {
-                executionState: 'FAILED',
-                errorClassification: 'INPUT_VALIDATION_FAILED',
-                message: `Missing required fields: ${missing.join(', ')}`,
-                timestamp: new Date().toISOString(),
-                missingFields: missing
-            }
-        };
+    if (typeof oktaClient.unassignUserFromApp === "function" && operation === "unassign") {
+        return oktaClient.unassignUserFromApp(request.app_id, request.target_identity);
     }
-
-    const operation = normalizeOperation(request);
-    const appIdentifier = request.app_identifier || request.target_resource;
-    const targetIdentity = request.target_identity || request.target_user_identifier;
 
     return {
-        allowed: true,
-        executionResult: {
-            executionState: 'SUCCESS',
-            executionMode: 'WRITE_SIMULATION',
-            agentName: 'AppAssignmentAgent',
-            downstreamSystem: request.target_system || 'okta',
-            message: `Application ${operation} simulated successfully.`,
-            timestamp: new Date().toISOString(),
-            normalizedInputPayloadHash: request.request_hash || null,
-            evidence: {
-                target_identity: targetIdentity,
-                app_identifier: appIdentifier,
-                operation,
-                expected_postcondition: request.expected_postcondition
-            }
-        }
+        simulated: true,
+        downstream_system: "Okta",
+        operation,
+        app_id: request.app_id,
+        target_identity: request.target_identity,
+        message: "App assignment execution is running in simulation mode because no live Okta app-assignment methods were found."
     };
 }
 
-module.exports = {
-    execute,
-    normalizeOperation,
-    validateRequest
-};
+async function execute(request, context) {
+    const policyConfig = context && context.policyConfig ? context.policyConfig : undefined;
+
+    if (!request.app_id) {
+        throw new Error("app_id is required for app assignment.");
+    }
+
+    if (!request.target_identity) {
+        throw new Error("target_identity is required for app assignment.");
+    }
+
+    if (!isAppAllowed(request.app_id, policyConfig)) {
+        throw new Error("Requested application is not allowlisted for this execution lane.");
+    }
+
+    const operation = normalizeOperation(request.operation);
+    if (!["assign", "unassign"].includes(operation)) {
+        throw new Error("App assignment operation must be assign or unassign.");
+    }
+
+    const startedAt = new Date().toISOString();
+
+    try {
+        await logAuditEvent({
+            correlation_id: request.correlation_id,
+            event_name: "APP_ASSIGNMENT_EXECUTION_STARTED",
+            actor: "AppAssignmentAgent",
+            severity: "info",
+            category: "execution",
+            message: "App assignment execution started.",
+            details: {
+                operation,
+                app_id: request.app_id,
+                target_identity: request.target_identity
+            }
+        });
+
+        const result = await executeWithRetry(
+            async function performOperation() {
+                return executeCore(request);
+            },
+            {
+                context: { stage: "connector" },
+                retry: policyConfig && policyConfig.retry ? policyConfig.retry : undefined
+            }
+        );
+
+        incrementCounter("app_assignment_success_total", 1, {
+            operation
+        });
+
+        return {
+            execution_agent: "AppAssignmentAgent",
+            execution_tool_or_workflow: "Okta.AppAssignments",
+            execution_state: "SUCCESS",
+            execution_timestamp: startedAt,
+            execution_result: {
+                ...result,
+                operation,
+                app_id: request.app_id,
+                target_identity: request.target_identity
+            }
+        };
+    } catch (error) {
+        const classified = classifyError(error, { stage: "connector" });
+        incrementCounter("app_assignment_failure_total", 1, {
+            classification: classified.classification
+        });
+
+        await logAuditEvent({
+            correlation_id: request.correlation_id,
+            event_name: "APP_ASSIGNMENT_EXECUTION_FAILED",
+            actor: "AppAssignmentAgent",
+            severity: "error",
+            category: "failure",
+            message: error.message,
+            error,
+            details: {
+                classification: classified.classification,
+                operation,
+                app_id: request.app_id,
+                target_identity: request.target_identity
+            }
+        });
+
+        return {
+            execution_agent: "AppAssignmentAgent",
+            execution_tool_or_workflow: "Okta.AppAssignments",
+            execution_state: "FAILED",
+            execution_timestamp: startedAt,
+            execution_result: {
+                downstream_system: "Okta",
+                operation,
+                app_id: request.app_id,
+                target_identity: request.target_identity,
+                error_message: error.message,
+                error_classification: classified.classification
+            }
+        };
+    }
+}
+
+module.exports = { execute };

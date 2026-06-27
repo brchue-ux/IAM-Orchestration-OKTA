@@ -1,152 +1,101 @@
-// =====================================
-// COMPLETION AGENT (PRODUCTION)
-// =====================================
-// Purpose:
-// Determine final outcome of IAM request
-// and return user-facing completion status.
-//
-// Design:
-// - NEVER declare success without verification
-// - Interpret execution + verification + rollback states
-// - Produce safe user-facing result
-// - Generate completion evidence
-// =====================================
+"use strict";
 
-function buildCompletionResult({
-    status,
-    message,
-    correlationId,
-    actionFamily,
-    evidence = {},
-    details = {}
-}) {
-    return {
-        correlationId: correlationId || null,
-        actionFamily: actionFamily || null,
-        finalStatus: status,
-        userMessage: message,
-        evidence,
-        details,
-        completedAt: new Date().toISOString()
-    };
+/**
+ * completionAgent
+ *
+ * Converts verification results into:
+ * - current_status
+ * - final_status
+ * - safe completion message
+ *
+ * Rules:
+ * - NEVER claim success unless verification_result === "verified_success"
+ * - Always include a reference/correlation ID in the message
+ */
+
+function buildCompletionStatus(verificationResult) {
+    switch (verificationResult) {
+        case "verified_success":
+            return {
+                final_status: "completed_success",
+                current_status: "completed_verified"
+            };
+
+        case "verified_failure":
+            return {
+                final_status: "completed_failed",
+                current_status: "failed"
+            };
+
+        case "verification_pending":
+            return {
+                final_status: "pending_verification",
+                current_status: "verification_pending"
+            };
+
+        case "verification_inconclusive":
+            return {
+                final_status: "completed_unverified",
+                current_status: "completed_unverified"
+            };
+
+        case "verification_not_required_read_only":
+            return {
+                final_status: "completed_success",
+                current_status: "completed_verified"
+            };
+
+        default:
+            return {
+                final_status: "unknown",
+                current_status: "verification_pending"
+            };
+    }
 }
 
-// -------------------------------------
-// MAIN COMPLETION FUNCTION
-// -------------------------------------
-function determineCompletion(record, execution, verification, rollback, context = {}) {
-    const correlationId =
-        record?.correlation_id ||
-        record?.correlationId ||
-        null;
+function buildCompletionMessage(request) {
+    const id = request && request.correlation_id ? request.correlation_id : "unknown";
 
-    const actionFamily = execution?.actionFamily || null;
+    switch (request.final_status) {
+        case "completed_success":
+            return `✅ The approved action has been completed and verified. Reference ID: ${id}`;
 
-    const executionState = execution?.executionState;
-    const verificationState = verification?.verificationState;
-    const rollbackState = rollback?.rollbackState;
+        case "completed_failed":
+            return `❌ The action was attempted, but verification did not confirm the expected result. I’ve routed this for follow-up. Reference ID: ${id}`;
 
-    // ---------------------------------
-    // ✅ CASE 1 — VERIFIED SUCCESS
-    // ---------------------------------
-    if (
-        executionState === 'SUCCESS' &&
-        verificationState === 'PASSED'
-    ) {
-        return buildCompletionResult({
-            status: 'COMPLETED_VERIFIED',
-            message: `The approved action has been completed and verified.`,
-            correlationId,
-            actionFamily,
-            evidence: {
-                execution: execution?.evidence || {},
-                verification: verification?.evidence || {}
-            },
-            details: {
-                outcome: 'SUCCESS_VERIFIED'
-            }
-        });
+        case "pending_verification":
+            return `⏳ The action is still pending verification. I’ll update once confirmed. Reference ID: ${id}`;
+
+        case "completed_unverified":
+            return `⚠️ The action completed, but verification could not confirm the expected result. Follow-up may be required. Reference ID: ${id}`;
+
+        default:
+            return `ℹ️ Request is still being processed. Reference ID: ${id}`;
     }
+}
 
-    // ---------------------------------
-    // ❌ CASE 2 — ROLLBACK EXECUTED
-    // ---------------------------------
-    if (
-        executionState === 'SUCCESS' &&
-        verificationState === 'FAILED' &&
-        rollbackState === 'EXECUTED'
-    ) {
-        return buildCompletionResult({
-            status: 'ROLLED_BACK',
-            message: `The action was attempted but did not pass verification and has been rolled back for safety.`,
-            correlationId,
-            actionFamily,
-            evidence: {
-                execution: execution?.evidence || {},
-                verification: verification?.evidence || {},
-                rollback: rollback?.evidence || {}
-            },
-            details: {
-                outcome: 'FAILED_AND_ROLLED_BACK'
-            }
-        });
-    }
+/**
+ * Apply completion fields to a request record.
+ */
+function processCompletion(request, verificationResult) {
+    const status = buildCompletionStatus(verificationResult);
 
-    // ---------------------------------
-    // ⚠️ CASE 3 — VERIFICATION FAILED, NO ROLLBACK
-    // ---------------------------------
-    if (
-        executionState === 'SUCCESS' &&
-        verificationState === 'FAILED'
-    ) {
-        return buildCompletionResult({
-            status: 'VERIFICATION_FAILED',
-            message: `The action was attempted, but verification did not confirm the expected result. Further review is required.`,
-            correlationId,
-            actionFamily,
-            evidence: {
-                execution: execution?.evidence || {},
-                verification: verification?.evidence || {}
-            },
-            details: {
-                outcome: 'UNVERIFIED_STATE'
-            }
-        });
-    }
-
-    // ---------------------------------
-    // ❌ CASE 4 — EXECUTION FAILED
-    // ---------------------------------
-    if (executionState === 'FAILED') {
-        return buildCompletionResult({
-            status: 'EXECUTION_FAILED',
-            message: `The request could not be completed due to an execution failure.`,
-            correlationId,
-            actionFamily,
-            evidence: {
-                execution: execution?.evidence || {}
-            },
-            details: {
-                outcome: 'EXECUTION_ERROR'
-            }
-        });
-    }
-
-    // ---------------------------------
-    // ⚠️ FALLBACK CASE — UNKNOWN STATE
-    // ---------------------------------
-    return buildCompletionResult({
-        status: 'UNKNOWN',
-        message: `The request is in an unknown state and requires investigation.`,
-        correlationId,
-        actionFamily,
-        evidence: {},
-        details: {
-            outcome: 'UNKNOWN_STATE'
-        }
+    const completed = Object.assign({}, request, {
+        current_status: status.current_status,
+        final_status: status.final_status,
+        verification_result: verificationResult,
+        completion_message: buildCompletionMessage({
+            correlation_id: request && request.correlation_id ? request.correlation_id : null,
+            final_status: status.final_status
+        }),
+        completed_at: new Date().toISOString()
     });
+
+    return completed;
 }
 
 module.exports = {
-    determineCompletion
+    processCompletion,
+    buildCompletionStatus,
+    buildCompletionMessage
 };
