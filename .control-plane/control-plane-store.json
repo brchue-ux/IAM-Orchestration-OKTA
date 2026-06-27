@@ -1,0 +1,72 @@
+{
+  "agent_registry": [
+    {
+      "agent_name": "multiAgentRouter",
+      "purpose": "orchestration",
+      "environment": "dev",
+      "risk_tier": "control-plane",
+      "owner": "product",
+      "updated_at": "2026-06-27T00:05:38.995Z"
+    },
+    {
+      "agent_name": "readOnlyStatusAgent",
+      "purpose": "read-only lookup",
+      "environment": "dev",
+      "risk_tier": "read-only",
+      "owner": "operations",
+      "updated_at": "2026-06-27T00:05:38.996Z"
+    },
+    {
+      "agent_name": "groupFulfillmentAgent",
+      "purpose": "group fulfillment",
+      "environment": "dev",
+      "risk_tier": "low",
+      "owner": "operations",
+      "updated_at": "2026-06-27T00:05:38.997Z"
+    },
+    {
+      "agent_name": "appAssignmentAgent",
+      "purpose": "application assignment",
+      "environment": "dev",
+      "risk_tier": "low-to-moderate",
+      "owner": "operations",
+      "updated_at": "2026-06-27T00:05:38.998Z"
+    },
+    {
+      "agent_name": "verificationReadBackAgent",
+      "purpose": "verification",
+      "environment": "dev",
+      "risk_tier": "control",
+      "owner": "security",
+      "updated_at": "2026-06-27T00:05:38.999Z"
+    },
+    {
+      "agent_name": "completionSupportAgent",
+      "purpose": "completion messaging",
+      "environment": "dev",
+      "risk_tier": "control",
+      "owner": "product",
+      "updated_at": "2026-06-27T00:05:39.000Z"
+    },
+    {
+      "agent_name": "autoHealingRetryService",
+      "purpose": "verification-only reconciliation retries",
+      "environment": "dev",
+      "risk_tier": "operations",
+      "owner": "operations",
+      "updated_at": "2026-06-27T00:05:39.000Z"
+    },
+    {
+      "agent_name": "autoHealScheduler",
+      "purpose": "bounded background recovery scheduler",
+      "environment": "dev",
+      "risk_tier": "operations",
+      "owner": "operations",
+      "updated_at": "2026-06-27T00:05:39.001Z"
+    }
+  ],
+  "policy_compliance": [],
+  "alerts": [],
+  "releases": [],
+  "rollback_events": []
+}

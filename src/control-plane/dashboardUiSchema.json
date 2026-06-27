@@ -1,0 +1,137 @@
+{
+  "schema_version": "1.0.0",
+  "dashboard_id": "enterprise_iam_control_plane",
+  "title": "Enterprise IAM Control Plane",
+  "description": "UI schema for a real-time dashboard covering request status, verification posture, alerts, auto-heal state, and promotion readiness.",
+  "layout": {
+    "type": "grid",
+    "columns": 12,
+    "row_height": 120
+  },
+  "widgets": [
+    {
+      "id": "summary_cards",
+      "type": "summary_cards",
+      "title": "Request Summary",
+      "position": { "x": 0, "y": 0, "w": 12, "h": 2 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/dashboard",
+        "path": "request_summary"
+      },
+      "cards": [
+        { "label": "Total Requests", "path": "total", "format": "number" },
+        { "label": "Waiting on Operations", "path": "needing_operations", "format": "number" }
+      ]
+    },
+    {
+      "id": "status_breakdown",
+      "type": "bar_chart",
+      "title": "Requests by Status",
+      "position": { "x": 0, "y": 2, "w": 6, "h": 4 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/dashboard",
+        "path": "request_summary.by_status"
+      },
+      "x_axis": "status",
+      "y_axis": "count"
+    },
+    {
+      "id": "verification_breakdown",
+      "type": "bar_chart",
+      "title": "Verification Outcomes",
+      "position": { "x": 6, "y": 2, "w": 6, "h": 4 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/dashboard",
+        "path": "request_summary.by_verification_result"
+      },
+      "x_axis": "verification_result",
+      "y_axis": "count"
+    },
+    {
+      "id": "alerts_summary",
+      "type": "summary_cards",
+      "title": "Alerts",
+      "position": { "x": 0, "y": 6, "w": 6, "h": 2 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/dashboard",
+        "path": "alerts_summary"
+      },
+      "cards": [
+        { "label": "Total Alerts", "path": "total", "format": "number" },
+        { "label": "High Severity", "path": "high_severity", "format": "number" }
+      ]
+    },
+    {
+      "id": "promotion_readiness",
+      "type": "status_panel",
+      "title": "Promotion Readiness",
+      "position": { "x": 6, "y": 6, "w": 6, "h": 2 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/dashboard",
+        "path": "promotion_readiness"
+      },
+      "fields": [
+        { "label": "Passed", "path": "passed", "format": "boolean" },
+        { "label": "Reason", "path": "reason", "format": "text" }
+      ]
+    },
+    {
+      "id": "scheduler_state",
+      "type": "status_panel",
+      "title": "Auto-Heal Scheduler",
+      "position": { "x": 0, "y": 8, "w": 6, "h": 2 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/scheduler",
+        "path": "scheduler"
+      },
+      "fields": [
+        { "label": "Running", "path": "running", "format": "boolean" },
+        { "label": "Sweep in Progress", "path": "sweep_in_progress", "format": "boolean" },
+        { "label": "Shutdown in Progress", "path": "shutdown_in_progress", "format": "boolean" }
+      ]
+    },
+    {
+      "id": "recent_requests",
+      "type": "data_table",
+      "title": "Recently Updated Requests",
+      "position": { "x": 6, "y": 8, "w": 6, "h": 4 },
+      "data_binding": {
+        "endpoint": "/api/control-plane/dashboard",
+        "path": "request_summary.recently_updated"
+      },
+      "columns": [
+        { "label": "Correlation ID", "path": "correlation_id" },
+        { "label": "Status", "path": "current_status" },
+        { "label": "Verification", "path": "verification_result" },
+        { "label": "Waiting On", "path": "waiting_on" },
+        { "label": "Updated At", "path": "updated_at" }
+      ]
+    },
+    {
+      "id": "metrics_snapshot",
+      "type": "json_panel",
+      "title": "Metrics Snapshot",
+      "position": { "x": 0, "y": 10, "w": 12, "h": 4 },
+      "data_binding": {
+        "endpoint": "/api/metrics/json",
+        "path": ""
+      }
+    }
+  ],
+  "actions": [
+    {
+      "id": "run_auto_heal_sweep",
+      "label": "Run Auto-Heal Sweep",
+      "method": "POST",
+      "endpoint": "/api/control-plane/dashboard/auto-heal-sweep",
+      "confirmation_required": true
+    },
+    {
+      "id": "run_scheduler_manual_sweep",
+      "label": "Run Scheduler Sweep",
+      "method": "POST",
+      "endpoint": "/api/control-plane/scheduler/run",
+      "confirmation_required": true
+    }
+  ]
+}
